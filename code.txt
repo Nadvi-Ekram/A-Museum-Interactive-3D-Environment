@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A Museum - Three.js</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.65);
+            padding: 14px 18px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 13px;
+            line-height: 1.8;
+            border: 1px solid rgba(255,255,255,0.15);
+        }
+        #info b { color: #ffd700; font-size: 15px; }
+    </style>
+</head>
+<body>
+<div id="info">
+    <b>A Museum</b><br>
+    W / A / S / D &nbsp;&mdash;&nbsp; Move camera<br>
+    Q / E &nbsp;&mdash;&nbsp; Rotate camera left / right<br>
+    1 / 2 / 3 &nbsp;&mdash;&nbsp; Change painting texture<br>
+    Mouse Click &nbsp;&mdash;&nbsp; Cycle painting texture
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// =============================================================
+//  SCENE SETUP
+// =============================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 20, 60);
+
+const camera = new THREE.PerspectiveCamera(
+    60,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    100
+);
+camera.position.set(0, 2, 9);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+// =============================================================
+//  CUSTOM SHADER — MARBLE (for statue)
+// =============================================================
+const marbleVertexShader = `
+    varying vec2  vUv;
+    varying vec3  vNormal;
+    varying vec3  vWorldPosition;
+
+    void main() {
+        vUv = uv;
+        vNormal = normalize(normalMatrix * normal);
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = wp.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+`;
+
+const marbleFragmentShader = `
+    uniform vec3  uLightPos;
+    uniform vec3  uLightColor;
+    uniform float uTime;
+
+    varying vec2  vUv;
+    varying vec3  vNormal;
+    varying vec3  vWorldPosition;
+
+    float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    }
+    float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        float a = hash(i);
+        float b = hash(i + vec2(1.0, 0.0));
+        float c = hash(i + vec2(0.0, 1.0));
+        float d = hash(i + vec2(1.0, 1.0));
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+    }
+
+    void main() {
+        // Marble vein pattern
+        float n  = noise(vUv * 8.0) * 0.5 + noise(vUv * 20.0) * 0.25;
+        float m  = sin(vUv.x * 12.0 + n * 6.0) * 0.5 + 0.5;
+        vec3 col = mix(vec3(0.92, 0.90, 0.87), vec3(0.58, 0.55, 0.52), m);
+
+        // Diffuse lighting
+        vec3  L    = normalize(uLightPos - vWorldPosition);
+        float diff = max(dot(vNormal, L), 0.0);
+
+        // Specular (Blinn-Phong)
+        vec3  V    = normalize(cameraPosition - vWorldPosition);
+        vec3  H    = normalize(L + V);
+        float spec = pow(max(dot(vNormal, H), 0.0), 64.0);
+
+        vec3 ambient  = vec3(0.18);
+        vec3 diffuse  = diff * uLightColor;
+        vec3 specular = spec * vec3(0.8);
+
+        gl_FragColor = vec4(col * (ambient + diffuse) + specular, 1.0);
+    }
+`;
+
+// =============================================================
+//  CUSTOM SHADER — STONE WALL
+// =============================================================
+const wallVertexShader = `
+    varying vec2 vUv;
+    varying vec3 vNormal;
+    varying vec3 vWorldPosition;
+    void main() {
+        vUv = uv;
+        vNormal = normalize(normalMatrix * normal);
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = wp.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+`;
+
+const wallFragmentShader = `
+    uniform vec3 uLightPos;
+    uniform vec3 uLightColor;
+    varying vec2 vUv;
+    varying vec3 vNormal;
+    varying vec3 vWorldPosition;
+
+    float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    void main() {
+        // Stone brick pattern
+        vec2  scaled = vUv * vec2(8.0, 4.0);
+        float row    = floor(scaled.y);
+        float offset = mod(row, 2.0) * 0.5;
+        vec2  cell   = floor(scaled + vec2(offset, 0.0));
+        float r      = hash(cell);
+
+        vec3  stone = mix(vec3(0.52, 0.47, 0.42), vec3(0.72, 0.67, 0.60), r);
+
+        // Mortar lines
+        vec2  frac  = fract(scaled + vec2(offset, 0.0));
+        float mortar = step(0.04, frac.x) * step(0.06, frac.y);
+        stone = mix(vec3(0.28, 0.26, 0.24), stone, mortar);
+
+        // Lighting
+        vec3  L    = normalize(uLightPos - vWorldPosition);
+        float diff = max(dot(vNormal, L), 0.12);
+
+        gl_FragColor = vec4(stone * diff * uLightColor, 1.0);
+    }
+`;
+
+// =============================================================
+//  PROCEDURAL PAINTING TEXTURES
+// =============================================================
+function makeTexture0() {               // Starry-night style
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 512;
+    const c = cv.getContext('2d');
+
+    // Sky gradient
+    const sky = c.createLinearGradient(0, 0, 0, 320);
+    sky.addColorStop(0,   '#04042a');
+    sky.addColorStop(1,   '#0d1b60');
+    c.fillStyle = sky; c.fillRect(0, 0, 512, 320);
+
+    // Stars
+    for (let i = 0; i < 220; i++) {
+        const x = Math.random() * 512, y = Math.random() * 280;
+        const r = Math.random() * 2.5 + 0.5;
+        const g = c.createRadialGradient(x, y, 0, x, y, r * 4);
+        g.addColorStop(0,   'rgba(255,255,210,1)');
+        g.addColorStop(1,   'rgba(255,255,210,0)');
+        c.fillStyle = g;
+        c.beginPath(); c.arc(x, y, r * 4, 0, Math.PI * 2); c.fill();
+    }
+
+    // Moon
+    const mg = c.createRadialGradient(390, 75, 0, 390, 75, 55);
+    mg.addColorStop(0, '#fffacc'); mg.addColorStop(1, '#ffc726');
+    c.fillStyle = mg; c.beginPath(); c.arc(390, 75, 55, 0, Math.PI * 2); c.fill();
+
+    // Swirling sky lines
+    for (let i = 0; i < 18; i++) {
+        c.strokeStyle = `rgba(80,130,255,${0.15 + Math.random() * 0.2})`;
+        c.lineWidth = 2;
+        c.beginPath();
+        c.arc(Math.random() * 512, Math.random() * 250, 25 + i * 7, 0, Math.PI * 1.5);
+        c.stroke();
+    }
+
+    // Ground
+    const grd = c.createLinearGradient(0, 300, 0, 512);
+    grd.addColorStop(0, '#1b4d1b'); grd.addColorStop(1, '#0e2e0e');
+    c.fillStyle = grd; c.fillRect(0, 300, 512, 212);
+
+    // Caption
+    c.fillStyle = 'rgba(255,255,200,0.85)';
+    c.font = 'italic bold 18px serif';
+    c.fillText('Starry Night', 12, 496);
+    return new THREE.CanvasTexture(cv);
+}
+
+function makeTexture1() {               // Abstract colourful
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 512;
+    const c = cv.getContext('2d');
+    c.fillStyle = '#fdf6e3'; c.fillRect(0, 0, 512, 512);
+
+    const palette = ['#c0392b','#2980b9','#e67e22','#27ae60','#8e44ad','#16a085','#f1c40f'];
+    for (let i = 0; i < 30; i++) {
+        c.globalAlpha  = 0.55 + Math.random() * 0.4;
+        c.fillStyle    = palette[i % palette.length];
+        const x = Math.random() * 512, y = Math.random() * 512;
+        const s = 25 + Math.random() * 110;
+        if (Math.random() > 0.45) {
+            c.fillRect(x, y, s, s * (0.5 + Math.random()));
+        } else {
+            c.beginPath(); c.arc(x, y, s / 2, 0, Math.PI * 2); c.fill();
+        }
+    }
+    c.globalAlpha = 1;
+    c.strokeStyle = '#222'; c.lineWidth = 3;
+    c.strokeRect(4, 4, 504, 504);
+    c.fillStyle = '#111'; c.font = 'italic bold 18px serif';
+    c.fillText('Abstract Composition', 12, 498);
+    return new THREE.CanvasTexture(cv);
+}
+
+function makeTexture2() {               // Sunny landscape
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 512;
+    const c = cv.getContext('2d');
+
+    // Sky
+    const sky = c.createLinearGradient(0, 0, 0, 300);
+    sky.addColorStop(0, '#5aabdb'); sky.addColorStop(1, '#b8dff5');
+    c.fillStyle = sky; c.fillRect(0, 0, 512, 300);
+
+    // Sun
+    const sg = c.createRadialGradient(90, 70, 0, 90, 70, 65);
+    sg.addColorStop(0, '#fffde0'); sg.addColorStop(0.5, '#ffd000'); sg.addColorStop(1, 'rgba(255,165,0,0)');
+    c.fillStyle = sg; c.fillRect(0, 0, 200, 200);
+
+    // Clouds
+    c.fillStyle = 'rgba(255,255,255,0.88)';
+    [[90,60,65],[230,85,48],[370,55,72],[460,95,38]].forEach(([x,y,r]) => {
+        c.beginPath();
+        c.arc(x, y, r, 0, Math.PI * 2);
+        c.arc(x + r * 0.75, y - 12, r * 0.65, 0, Math.PI * 2);
+        c.arc(x + r * 1.4,  y,      r * 0.75, 0, Math.PI * 2);
+        c.fill();
+    });
+
+    // Ground
+    const gg = c.createLinearGradient(0, 300, 0, 512);
+    gg.addColorStop(0, '#4caf50'); gg.addColorStop(1, '#1b5e20');
+    c.fillStyle = gg; c.fillRect(0, 300, 512, 212);
+
+    // Trees
+    [70, 175, 290, 390, 475].forEach(tx => {
+        c.fillStyle = '#5d4037'; c.fillRect(tx - 8, 248, 16, 75);
+        c.fillStyle = '#2e7d32';
+        c.beginPath(); c.moveTo(tx, 145);
+        c.lineTo(tx - 48, 288); c.lineTo(tx + 48, 288); c.closePath(); c.fill();
+    });
+
+    // Path
+    c.fillStyle = '#c8a96e';
+    c.beginPath(); c.moveTo(210, 512); c.lineTo(270, 512);
+    c.lineTo(295, 300); c.lineTo(230, 300); c.closePath(); c.fill();
+
+    c.fillStyle = '#1a237e'; c.font = 'italic bold 18px serif';
+    c.fillText('Summer Landscape', 12, 498);
+    return new THREE.CanvasTexture(cv);
+}
+
+const paintingTextures = [makeTexture0(), makeTexture1(), makeTexture2()];
+let activeTex = 0;
+
+// =============================================================
+//  FLOOR & CEILING
+// =============================================================
+function makeTileTexture() {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 512;
+    const c = cv.getContext('2d');
+    const ts = 64;
+    for (let r = 0; r < 8; r++) {
+        for (let col = 0; col < 8; col++) {
+            c.fillStyle = (r + col) % 2 === 0 ? '#c4aa80' : '#7a5c34';
+            c.fillRect(col * ts, r * ts, ts, ts);
+            c.strokeStyle = 'rgba(0,0,0,0.18)';
+            c.lineWidth = 1;
+            c.strokeRect(col * ts + 1, r * ts + 1, ts - 2, ts - 2);
+        }
+    }
+    const t = new THREE.CanvasTexture(cv);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(4, 4);
+    return t;
+}
+
+function makeCeilTexture() {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 256;
+    const c = cv.getContext('2d');
+    c.fillStyle = '#ede8d8'; c.fillRect(0, 0, 256, 256);
+    c.strokeStyle = '#cec4ae'; c.lineWidth = 1.5;
+    for (let i = 0; i <= 256; i += 32) {
+        c.beginPath(); c.moveTo(i, 0);   c.lineTo(i, 256); c.stroke();
+        c.beginPath(); c.moveTo(0, i);   c.lineTo(256, i); c.stroke();
+    }
+    const t = new THREE.CanvasTexture(cv);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(4, 4);
+    return t;
+}
+
+const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(20, 20),
+    new THREE.MeshLambertMaterial({ map: makeTileTexture() })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+const ceiling = new THREE.Mesh(
+    new THREE.PlaneGeometry(20, 20),
+    new THREE.MeshLambertMaterial({ map: makeCeilTexture() })
+);
+ceiling.rotation.x = Math.PI / 2;
+ceiling.position.y = 6;
+scene.add(ceiling);
+
+// =============================================================
+//  WALLS (stone-brick custom shader)
+// =============================================================
+function makeWallUniforms(lp) {
+    return {
+        uLightPos:   { value: lp.clone() },
+        uLightColor: { value: new THREE.Vector3(1.0, 0.94, 0.84) }
+    };
+}
+
+function addWall(w, h, x, y, z, ry) {
+    const mat = new THREE.ShaderMaterial({
+        vertexShader:   wallVertexShader,
+        fragmentShader: wallFragmentShader,
+        uniforms: makeWallUniforms(new THREE.Vector3(0, 5, 0)),
+        side: THREE.FrontSide
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+    mesh.position.set(x, y, z);
+    mesh.rotation.y = ry;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    return mesh;
+}
+
+addWall(20, 6,   0, 3, -10,  0);              // back
+addWall(20, 6,   0, 3,  10,  Math.PI);        // front
+addWall(20, 6, -10, 3,   0,  Math.PI / 2);   // left
+addWall(20, 6,  10, 3,   0, -Math.PI / 2);   // right
+
+// =============================================================
+//  STATUE — marble custom shader
+// =============================================================
+const marbleUniforms = {
+    uLightPos:   { value: new THREE.Vector3(0, 5.5, -5) },
+    uLightColor: { value: new THREE.Vector3(1.0, 0.96, 0.88) },
+    uTime:       { value: 0.0 }
+};
+
+const marbleMat = new THREE.ShaderMaterial({
+    vertexShader:   marbleVertexShader,
+    fragmentShader: marbleFragmentShader,
+    uniforms:       marbleUniforms
+});
+
+const statueX = -4, statueZ = -5;
+
+// Pedestal
+const pedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.85, 1.0, 14), marbleMat);
+pedestal.position.set(statueX, 0.5, statueZ);
+pedestal.castShadow = pedestal.receiveShadow = true;
+scene.add(pedestal);
+
+// Torso
+const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.38, 1.5, 12), marbleMat);
+torso.position.set(statueX, 2.25, statueZ);
+torso.castShadow = true;
+scene.add(torso);
+
+// Head
+const head = new THREE.Mesh(new THREE.SphereGeometry(0.33, 20, 20), marbleMat);
+head.position.set(statueX, 3.28, statueZ);
+head.castShadow = true;
+scene.add(head);
+
+// Arms
+const armGeo = new THREE.CylinderGeometry(0.09, 0.12, 0.95, 8);
+
+const leftArm = new THREE.Mesh(armGeo, marbleMat);
+leftArm.position.set(statueX - 0.52, 2.3, statueZ);
+leftArm.rotation.z = Math.PI / 5.5;
+leftArm.castShadow = true;
+scene.add(leftArm);
+
+const rightArm = new THREE.Mesh(armGeo, marbleMat);
+rightArm.position.set(statueX + 0.52, 2.3, statueZ);
+rightArm.rotation.z = -Math.PI / 5.5;
+rightArm.castShadow = true;
+scene.add(rightArm);
+
+// Nameplate below pedestal
+const plateGeo  = new THREE.BoxGeometry(1.2, 0.25, 0.05);
+const plateMat  = new THREE.MeshLambertMaterial({ color: 0x8b6914 });
+const nameplate = new THREE.Mesh(plateGeo, plateMat);
+nameplate.position.set(statueX, 0.12, statueZ + 0.85);
+scene.add(nameplate);
+
+// =============================================================
+//  PAINTINGS — texture + frame
+// =============================================================
+const paintingMats = [];   // store canvas materials for texture swap
+
+function createPainting(x, y, z, ry, texIdx) {
+    const group = new THREE.Group();
+
+    // Gilded frame
+    const frameMat = new THREE.MeshLambertMaterial({ color: 0x9b7720 });
+    const frame    = new THREE.Mesh(new THREE.BoxGeometry(3.3, 2.3, 0.14), frameMat);
+    frame.castShadow = true;
+    group.add(frame);
+
+    // Canvas
+    const canvasMat = new THREE.MeshLambertMaterial({ map: paintingTextures[texIdx] });
+    paintingMats.push(canvasMat);
+    const canvas = new THREE.Mesh(new THREE.PlaneGeometry(2.9, 1.9), canvasMat);
+    canvas.position.z = 0.09;
+    group.add(canvas);
+
+    group.position.set(x, y, z);
+    group.rotation.y = ry;
+    scene.add(group);
+}
+
+createPainting( 4.0, 3,  -9.85,  0,               0);
+createPainting(-9.85, 3,  -2,    Math.PI / 2,      1);
+
+// =============================================================
+//  LIGHTING
+// =============================================================
+// Ambient
+scene.add(new THREE.AmbientLight(0x40406a, 0.5));
+
+// Main ceiling point lights
+const ceilLight1 = new THREE.PointLight(0xfff5e0, 1.1, 22);
+ceilLight1.position.set(0, 5.5, -5);
+ceilLight1.castShadow = true;
+scene.add(ceilLight1);
+
+const ceilLight2 = new THREE.PointLight(0xfff5e0, 0.9, 22);
+ceilLight2.position.set(0, 5.5, 4);
+ceilLight2.castShadow = true;
+scene.add(ceilLight2);
+
+// Animated spotlight on the statue
+const spotlight = new THREE.SpotLight(0xffeedd, 3.5, 14, Math.PI / 9, 0.3, 1.2);
+spotlight.position.set(statueX, 5.5, statueZ);
+spotlight.castShadow = true;
+spotlight.shadow.mapSize.set(1024, 1024);
+scene.add(spotlight);
+scene.add(spotlight.target);
+spotlight.target.position.set(statueX, 0, statueZ);
+
+// Painting accent lights
+const pLight1 = new THREE.PointLight(0xfff0cc, 1.6, 6);
+pLight1.position.set(4, 4.5, -9.2);
+scene.add(pLight1);
+
+const pLight2 = new THREE.PointLight(0xfff0cc, 1.6, 6);
+pLight2.position.set(-9.2, 4.5, -2);
+scene.add(pLight2);
+
+// =============================================================
+//  INPUT — keyboard & mouse
+// =============================================================
+const keys = {};
+document.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+
+    // Texture change via 1/2/3
+    if (e.key === '1') swapTexture(0);
+    if (e.key === '2') swapTexture(1);
+    if (e.key === '3') swapTexture(2);
+});
+document.addEventListener('keyup',  e => { keys[e.key.toLowerCase()] = false; });
+
+// Mouse click — cycle texture
+const raycaster = new THREE.Raycaster();
+const mouse     = new THREE.Vector2();
+document.addEventListener('click', e => {
+    mouse.x = (e.clientX / window.innerWidth)  *  2 - 1;
+    mouse.y = (e.clientY / window.innerHeight) * -2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    // Cycle through textures on any click
+    activeTex = (activeTex + 1) % paintingTextures.length;
+    swapTexture(activeTex);
+});
+
+function swapTexture(idx) {
+    activeTex = idx;
+    paintingMats.forEach((mat, i) => {
+        mat.map = paintingTextures[(idx + i) % paintingTextures.length];
+        mat.needsUpdate = true;
+    });
+}
+
+// =============================================================
+//  CAMERA MOVEMENT
+// =============================================================
+let camAngle = 0;
+const SPEED  = 0.09;
+
+function updateCamera() {
+    if (keys['q']) camAngle -= 0.025;
+    if (keys['e']) camAngle += 0.025;
+    if (keys['a'] || keys['arrowleft'])  camAngle -= 0.022;
+    if (keys['d'] || keys['arrowright']) camAngle += 0.022;
+
+    const fwd = new THREE.Vector3(-Math.sin(camAngle), 0, -Math.cos(camAngle));
+
+    if (keys['w'] || keys['arrowup'])   camera.position.addScaledVector(fwd,  SPEED);
+    if (keys['s'] || keys['arrowdown']) camera.position.addScaledVector(fwd, -SPEED);
+
+    // Keep camera inside museum
+    camera.position.x = THREE.MathUtils.clamp(camera.position.x, -9, 9);
+    camera.position.z = THREE.MathUtils.clamp(camera.position.z, -9, 9);
+    camera.position.y = 2;
+
+    camera.lookAt(
+        camera.position.x + fwd.x * 10,
+        2,
+        camera.position.z + fwd.z * 10
+    );
+}
+
+// =============================================================
+//  ANIMATION LOOP
+// =============================================================
+let t = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+    t += 0.016;
+
+    // --- Spotlight sweeps across statue ---
+    spotlight.position.x = statueX + Math.sin(t * 0.55) * 2.8;
+    spotlight.position.z = statueZ + Math.cos(t * 0.35) * 1.5;
+    spotlight.target.position.x = statueX + Math.sin(t * 0.55) * 0.4;
+    spotlight.target.position.z = statueZ;
+    spotlight.target.updateMatrixWorld();
+
+    // Update marble shader's light position to follow spotlight
+    marbleUniforms.uLightPos.value.set(
+        spotlight.position.x,
+        spotlight.position.y,
+        spotlight.position.z
+    );
+    marbleUniforms.uTime.value = t;
+
+    updateCamera();
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>
+
